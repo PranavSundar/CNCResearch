@@ -39,9 +39,9 @@ FEED        = 1500      # mm/min
 Z_SAFE      = 4.0       # mm  — plunge depth
 TARGET_FPS  = 80        # GRBL poll rate (Hz)
 
-CAM_INDEX   = 0         # 0 = first USB camera
-CAM_W       = 640
-CAM_H       = 480
+CAM_INDEX   = 1         # 0 = first USB camera
+CAM_W       = 1920
+CAM_H       = 1080
 TAG_FAMILY  = "tag36h11"
 TAG_SIZE_MM = 30.0      # physical side length of printed AprilTag (in) — measure yours!
 
