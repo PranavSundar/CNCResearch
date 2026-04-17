@@ -11,7 +11,7 @@ from datetime import datetime
 PORT       = "COM3"
 BAUD       = 115200
 FEED       = 1200     # mm/min
-Z_SAFE     = 73.9394  # mm
+Z_SAFE     = 73.9394  # mm for thin sharpie tip to just touch the paper (measured from bed to tip)
 TARGET_FPS = 80       # samples per second
 
 # Circle parameters
