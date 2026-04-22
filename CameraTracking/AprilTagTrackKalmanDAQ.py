@@ -23,10 +23,8 @@ import numpy as np
 import cv2
 import matplotlib.pyplot as plt
 from datetime import datetime
-import nidaqmx
-from nidaqmx.constants import AcquisitionType, TerminalConfiguration
-from scipy import signal, integrate
-from scipy.fft import fft, fftfreq
+import subprocess
+import importlib.util
 
 if not hasattr(cv2, "aruco"):
     sys.exit(
@@ -55,18 +53,9 @@ TAG_SIZE_MM = 30.0      # physical side length of printed AprilTag
 KALMAN_PROCESS_NOISE    = 0.5   # Process noise (velocity uncertainty, mm/s²)
 KALMAN_MEASUREMENT_NOISE = 2.0  # Measurement noise (camera detection noise, mm)
 
-# DAQ Configuration (from Measurement & Automation Explorer)
-DAQ_DEVICE = "cDAQ9185_22C6F90"                   # Ethernet cDAQ-9185 chassis S/N
-ACCEL_MODULE = 1                                   # Accelerometer module slot
-ACCEL_CHANNEL = "ai0"                              # Accelerometer channel (port 0)
-ACCEL_SAMPLE_RATE = 8192.5243                      # Sampling rate in scans/s
-ACCEL_RANGE = 10.0                                 # Input range (±10V)
-AE_MODULE = 2                                      # AE sensor module slot
-AE_CHANNEL = "ai0"                                 # AE sensor channel (port 0)
-AE_SAMPLE_RATE = 131147.541                        # Sampling rate in scans/s
-AE_RANGE = 10.0                                    # Input range (±10V)
+# DAQ Configuration (integrated from daq.py)
+DAQ_SCRIPT_PATH = os.path.join(os.path.dirname(__file__), "..", "Data Aquisition System", "daq.py")
 DAQ_DURATION = 0.1                                 # DAQ acquisition duration per tracking cycle (seconds)
-TERMINAL_CONFIG = TerminalConfiguration.DIFFERENTIAL
 
 # Data Output
 OUTPUT_DIR = "Data"                                # Output directory for CSV files
@@ -155,74 +144,70 @@ class KalmanFilter3D:
 
 
 # ── DAQ FUNCTIONS ─────────────────────────────────────────────────────────────
+def load_daq_module():
+    """Load the DAQ module from the separate daq.py script."""
+    try:
+        spec = importlib.util.spec_from_file_location("daq_module", DAQ_SCRIPT_PATH)
+        daq_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(daq_module)
+        print("[daq] Successfully loaded DAQ module")
+        return daq_module
+    except Exception as e:
+        print(f"[daq_error] Failed to load DAQ module: {e}")
+        return None
+
+
 def initialize_daq():
     """
-    Initialize dual DAQ channels for accelerometer and AE sensor.
+    Initialize DAQ by loading the module and setting up the task.
     Returns configured task or None on error.
     """
     try:
-        task = nidaqmx.Task()
+        daq_module = load_daq_module()
+        if daq_module is None:
+            return None
 
-        # Add accelerometer channel (NI 9215, Module 1)
-        accel_phys_ch = f"{DAQ_DEVICE}Mod{ACCEL_MODULE}/{ACCEL_CHANNEL}"
-        task.ai_channels.add_ai_voltage_chan(
-            physical_channel=accel_phys_ch,
-            min_val=-ACCEL_RANGE,
-            max_val=ACCEL_RANGE,
-            terminal_config=TERMINAL_CONFIG,
-            name_to_assign_to_channel="Accelerometer"
-        )
-
-        # Add AE sensor channel (NI 9223, Module 2)
-        ae_phys_ch = f"{DAQ_DEVICE}Mod{AE_MODULE}/{AE_CHANNEL}"
-        task.ai_channels.add_ai_voltage_chan(
-            physical_channel=ae_phys_ch,
-            min_val=-AE_RANGE,
-            max_val=AE_RANGE,
-            terminal_config=TERMINAL_CONFIG,
-            name_to_assign_to_channel="AE_Sensor"
-        )
-
-        # Calculate samples for each sensor
-        accel_samples = int(DAQ_DURATION * ACCEL_SAMPLE_RATE)
-        ae_samples = int(DAQ_DURATION * AE_SAMPLE_RATE)
-
-        # Configure timing using the faster sample rate (AE sensor)
-        task.timing.cfg_samp_clk_timing(
-            rate=AE_SAMPLE_RATE,
-            sample_mode=AcquisitionType.FINITE,
-            samps_per_chan=ae_samples
-        )
-
+        # Use the DAQ module's initialize_daq function
+        task, accel_samples, ae_samples = daq_module.initialize_daq()
+        print("[daq] DAQ task initialized successfully")
         return task, accel_samples, ae_samples
 
     except Exception as e:
         print(f"[daq_error] Failed to initialize DAQ: {e}")
-        return None, None, None
+        return None
 
 
 def acquire_sensor_data(task, accel_samples, ae_samples):
     """
-    Acquire a short burst of sensor data.
-    Returns (accel_data, ae_data) or (None, None) on error.
+    Acquire a burst of sensor data using the loaded DAQ functions.
+    Returns sensor statistics dict or None on error.
     """
     try:
-        task.start()
-        raw_data = task.read(number_of_samples_per_channel=ae_samples, timeout=DAQ_DURATION+1)
-        task.stop()
+        daq_module = load_daq_module()
+        if daq_module is None:
+            return None
 
-        # Convert to numpy array and separate channels
-        data_array = np.array(raw_data).T
+        # Use the DAQ module's acquire function
+        accel_data, ae_data, _, _ = daq_module.acquire_dual_sensor_data(task, accel_samples, ae_samples)
 
-        # Extract channels (trim accelerometer to its sample count)
-        accel_data = data_array[:accel_samples, 0]
-        ae_data = data_array[:ae_samples, 1]
-
-        return accel_data, ae_data
+        if accel_data is not None and ae_data is not None:
+            # Calculate statistics
+            record = {
+                'timestamp': datetime.now(),
+                'accel_mean': float(np.mean(accel_data)),
+                'accel_rms': float(np.sqrt(np.mean(accel_data**2))),
+                'accel_peak': float(np.max(np.abs(accel_data))),
+                'ae_mean': float(np.mean(ae_data)),
+                'ae_rms': float(np.sqrt(np.mean(ae_data**2))),
+                'ae_peak': float(np.max(np.abs(ae_data)))
+            }
+            return record
+        else:
+            return None
 
     except Exception as e:
         print(f"[daq_error] Failed to acquire sensor data: {e}")
-        return None, None
+        return None
 
 
 # ── UTILITY FUNCTIONS ─────────────────────────────────────────────────────────
@@ -468,11 +453,13 @@ def grbl_worker(grbl_records, start_ref, stop_event, home_event):
 
 
 def daq_worker(sensor_records, start_ref, stop_event, home_event):
-    """DAQ thread: acquires sensor data synchronized with tracking."""
-    # Initialize DAQ
-    task, accel_samples, ae_samples = initialize_daq()
-    if task is None:
+    """DAQ thread: acquires sensor data using imported DAQ functions."""
+    # Initialize DAQ task
+    task_result = initialize_daq()
+    if task_result is None:
         return
+
+    task, accel_samples, ae_samples = task_result
 
     # Wait for home position
     while not home_event.is_set():
@@ -481,30 +468,24 @@ def daq_worker(sensor_records, start_ref, stop_event, home_event):
     print("[daq] Starting sensor acquisition...")
 
     while not stop_event.is_set():
-        timestamp = datetime.now()
-
         # Acquire sensor data
-        accel_data, ae_data = acquire_sensor_data(task, accel_samples, ae_samples)
+        sensor_data = acquire_sensor_data(task, accel_samples, ae_samples)
 
-        if accel_data is not None and ae_data is not None:
-            # Calculate statistics
-            record = {
-                'timestamp': timestamp,
-                'accel_mean': float(np.mean(accel_data)),
-                'accel_rms': float(np.sqrt(np.mean(accel_data**2))),
-                'accel_peak': float(np.max(np.abs(accel_data))),
-                'ae_mean': float(np.mean(ae_data)),
-                'ae_rms': float(np.sqrt(np.mean(ae_data**2))),
-                'ae_peak': float(np.max(np.abs(ae_data)))
-            }
-            sensor_records.append(record)
+        if sensor_data is not None:
+            sensor_records.append(sensor_data)
 
         # Sleep to maintain timing
         time.sleep(DAQ_DURATION)
 
     # Cleanup
     if task is not None:
-        task.close()
+        try:
+            task.stop()
+            task.close()
+            print("[daq] DAQ task closed")
+        except Exception as e:
+            print(f"[daq] Error closing task: {e}")
+
     print("[daq] DAQ thread stopped")
 
 
