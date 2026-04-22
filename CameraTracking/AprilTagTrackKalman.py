@@ -13,6 +13,7 @@ Dependencies:
 """
 
 import sys
+import os
 import serial
 import time
 import re
@@ -331,36 +332,103 @@ def camera_worker(cam_records, start_ref, stop_event, home_event):
 
 # ── GRBL SERIAL THREAD ─────────────────────────────────────────────────────────
 def grbl_worker(grbl_records, start_ref, stop_event, home_event):
-    """Background thread: polls GRBL position via serial."""
-    while not home_event.is_set():
-        time.sleep(0.01)
+    """Background thread: sets up GRBL, runs motion sequence, polls position."""
+    ema_pos = [None, None, None]
+    interval = 1.0 / TARGET_FPS
 
     try:
-        ser = serial.Serial(PORT, BAUD, timeout=0.1)
-        ser.reset_input_buffer()
-        print(f"  [grbl] Connected to {PORT}@{BAUD}")
+        ser = serial.Serial(PORT, BAUD, timeout=1)
     except Exception as e:
         print(f"  [grbl] Failed to open port: {e}")
         return
 
-    pattern = re.compile(r"<.*?\|MPos:([\d.,\-]+)")
+    time.sleep(2)
+    ser.write(b"\r\n\r\n")
+    time.sleep(2)
+    ser.reset_input_buffer()
 
-    while not stop_event.is_set():
-        try:
-            ser.write(b"?")
-            time.sleep(1.0 / TARGET_FPS)
-            
-            line = ser.readline().decode('utf-8', errors='ignore').strip()
-            match = pattern.search(line)
-            if match:
-                parts = match.group(1).split(",")
-                x, y, z = float(parts[0]), float(parts[1]), float(parts[2])
-                t_now = time.time() - start_ref[0]
-                grbl_records.append([t_now, x, y, z])
-        except Exception:
-            pass
+    print("  [grbl] Setting up machine...")
+    ser.write(b"$X\n");    time.sleep(1)
+    ser.write(b"$10=0\n"); time.sleep(0.5)
+    ser.write(b"$H\n");    time.sleep(5)
+    ser.write(b"G21 G90 G92 X0 Y0 Z0\n"); time.sleep(1)
 
+    print("  [grbl] Waiting for camera home latch...")
+    if not home_event.wait(timeout=30.0):
+        print("  [grbl] WARNING: tag not detected within 30 s")
+
+    print(f"  [grbl] Starting square pattern ({SIDE} mm @ {FEED} mm/min)")
+
+    move_sequence = [
+        (f"G1 Z-{Z_SAFE:.1f} F{FEED}",   "Plunge Z"),
+        (f"G1 X{SIDE} Y0 F{FEED}",        "-> X+"),
+        (f"G1 X{SIDE} Y-{SIDE} F{FEED}", "-> Corner"),
+        (f"G1 X0 Y-{SIDE} F{FEED}",      "<- X-"),
+        (f"G1 X0 Y0 F{FEED}",            "<- Home"),
+        (f"G1 Z{Z_SAFE + 5:.1f} F{FEED}","Retract Z"),
+    ]
+
+    start_time = start_ref[0]
+
+    for cmd, label in move_sequence:
+        print(f"  [grbl] {label}")
+        ser.write((cmd + "\n").encode())
+
+        deadline       = time.time() + 90.0
+        idle_count     = 0
+        motion_started = False
+        ser.reset_input_buffer()
+
+        while time.time() < deadline and not stop_event.is_set():
+            poll_start = time.time()
+
+            ser.write(b"?\n")
+            time.sleep(0.02)
+
+            raw = ""
+            while ser.in_waiting:
+                try:
+                    raw += ser.readline().decode(errors="ignore").strip()
+                except Exception:
+                    pass
+
+            if raw:
+                match = re.search(
+                    r"WPos:([\d\.\-]+),([\d\.\-]+),([\d\.\-]+)", raw
+                ) or re.search(
+                    r"MPos:([\d\.\-]+),([\d\.\-]+),([\d\.\-]+)", raw
+                )
+                if match:
+                    raw_pos = [float(match.group(i)) for i in (1, 2, 3)]
+                    t_now = time.time() - start_time
+
+                    for ax in range(3):
+                        if ema_pos[ax] is None:
+                            ema_pos[ax] = raw_pos[ax]
+                        else:
+                            ema_pos[ax] = (
+                                0.8 * raw_pos[ax] + 0.2 * ema_pos[ax]
+                            )
+
+                    grbl_records.append([t_now, ema_pos[0], ema_pos[1], ema_pos[2]])
+
+                if "Run" in raw or "Jog" in raw:
+                    motion_started = True
+                    idle_count = 0
+                elif "Idle" in raw and motion_started:
+                    idle_count += 1
+                    if idle_count >= 3:
+                        break
+
+            elapsed = time.time() - poll_start
+            sleep_for = interval - elapsed
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+
+    ser.write(b"$H\n"); time.sleep(5)
+    stop_event.set()
     ser.close()
+    print("  [grbl] Done.")
 
 
 # ── GEOMETRY & ALIGNMENT ───────────────────────────────────────────────────────
@@ -523,7 +591,10 @@ def plot_results(cam_records, grbl_records, csv_stem):
     ax.axis('off')
 
     plt.tight_layout()
-    plot_path = f"Data/{csv_stem}.png"
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    data_dir = os.path.join(script_dir, "Data")
+    os.makedirs(data_dir, exist_ok=True)
+    plot_path = os.path.join(data_dir, f"{csv_stem}.png")
     plt.savefig(plot_path, dpi=100)
     print(f"[plot] Saved: {plot_path}")
     plt.close()
@@ -531,6 +602,11 @@ def plot_results(cam_records, grbl_records, csv_stem):
 
 # ── MAIN ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    # Get script directory and create Data folder if needed
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    data_dir = os.path.join(script_dir, "Data")
+    os.makedirs(data_dir, exist_ok=True)
+    
     now = datetime.now()
     csv_stem = f"apriltag_kalman_{now.strftime('%Y%m%d_%H%M%S')}"
 
@@ -547,9 +623,9 @@ if __name__ == "__main__":
     cam_thread.start()
     grbl_thread.start()
 
-    print("\n═══════════════════════════════════════════════════════════════")
+    print("\n=================================================================")
     print("     AprilTag Tracking with 3D Kalman Filter (Position + Velocity)")
-    print("═══════════════════════════════════════════════════════════════\n")
+    print("=================================================================\n")
     print(f"  Config:")
     print(f"    CAM_INDEX = {CAM_INDEX}  |  RES = {CAM_W}x{CAM_H}")
     print(f"    GRBL: {PORT} @ {BAUD}")
@@ -558,8 +634,7 @@ if __name__ == "__main__":
     print(f"    Measurement Noise Z: {KALMAN_MEASUREMENT_NOISE*2.0} mm\n")
 
     try:
-        while cam_thread.is_alive() or grbl_thread.is_alive():
-            time.sleep(0.1)
+        stop_event.wait()
     except KeyboardInterrupt:
         print("\n[main] Interrupt received, shutting down...")
         stop_event.set()
@@ -570,18 +645,20 @@ if __name__ == "__main__":
     print(f"\n[data] Captured {len(cam_records)} camera records, {len(grbl_records)} GRBL records")
 
     if cam_records:
-        with open(f"Data/{csv_stem}_cam.csv", 'w', newline='') as f:
+        cam_file = os.path.join(data_dir, f"{csv_stem}_cam.csv")
+        with open(cam_file, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(["time_s", "cx_px", "cy_px", "tx_mm", "ty_mm", "tz_mm", "tag_side_px"])
             writer.writerows(cam_records)
-        print(f"[data] Saved: Data/{csv_stem}_cam.csv")
+        print(f"[data] Saved: {cam_file}")
 
     if grbl_records:
-        with open(f"Data/{csv_stem}_grbl.csv", 'w', newline='') as f:
+        grbl_file = os.path.join(data_dir, f"{csv_stem}_grbl.csv")
+        with open(grbl_file, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(["time_s", "x_mm", "y_mm", "z_mm"])
             writer.writerows(grbl_records)
-        print(f"[data] Saved: Data/{csv_stem}_grbl.csv")
+        print(f"[data] Saved: {grbl_file}")
 
     plot_results(cam_records, grbl_records, csv_stem)
     print("\n[main] Done.")
