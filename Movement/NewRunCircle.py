@@ -5,6 +5,10 @@ import csv
 import numpy as np
 import matplotlib.pyplot as plt
 from datetime import datetime
+import os
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from pub_fig import pub_fig
 
 
 #  CONFIGURATION
@@ -183,6 +187,7 @@ axes[0, 0].set_xlabel("X (mm)"); axes[0, 0].set_ylabel("Y (mm)")
 axes[0, 0].set_title("Toolpath")
 axes[0, 0].set_aspect("equal"); axes[0, 0].grid(True)
 axes[0, 0].legend(["Path", "Start", "End"], loc="best")
+pub_fig(axes[0, 0], fig)
 
 # X, Y, Z positions
 for i, (col, label, color) in enumerate([
@@ -191,18 +196,21 @@ for i, (col, label, color) in enumerate([
     ax.plot(t, pos[:, col], color=color, linewidth=1.5)
     ax.set_xlabel("Time (s)"); ax.set_ylabel(f"{label} (mm)")
     ax.set_title(f"{label} Position"); ax.grid(True)
+    pub_fig(ax, fig)
 
 # Velocity
 axes[1, 1].plot(t_vel, speed, "b-", linewidth=1.5)
 axes[1, 1].set_xlabel("Time (s)"); axes[1, 1].set_ylabel("Speed (mm/s)")
 axes[1, 1].set_title(f"Velocity (max: {speed.max():.1f} mm/s)")
 axes[1, 1].set_ylim(0, speed.max() * 1.1); axes[1, 1].grid(True)
+pub_fig(axes[1, 1], fig)
 
 # Acceleration
 axes[1, 2].plot(t_acc, accel, "c-", linewidth=1.5)
 axes[1, 2].set_xlabel("Time (s)"); axes[1, 2].set_ylabel("Accel (mm/s²)")
 axes[1, 2].set_title(f"Acceleration (max: ±{np.abs(accel).max():.1f} mm/s²)")
 axes[1, 2].grid(True)
+pub_fig(axes[1, 2], fig)
 
 plt.tight_layout()
 plt.savefig("cnc_run.png", dpi=150)

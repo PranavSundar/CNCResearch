@@ -23,6 +23,8 @@ import numpy as np
 import cv2
 import matplotlib.pyplot as plt
 from datetime import datetime
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from pub_fig import pub_fig
 
 if not hasattr(cv2, "aruco"):
     sys.exit(
@@ -46,9 +48,8 @@ TAG_FAMILY  = "tag36h11"
 TAG_SIZE_MM = 30.0      # physical side length of printed AprilTag
 
 # Kalman Filter Configuration
-KALMAN_PROCESS_NOISE    = 0.5   # Process noise (velocity uncertainty, mm/s²)
-KALMAN_MEASUREMENT_NOISE = 2.0  # Measurement noise (camera detection noise, mm)
-KALMAN_OUTLIER_SIGMA    = 3.0   # Reject measurements >N std deviations from prediction
+KALMAN_PROCESS_NOISE    = 10.0  # Process noise (mm/s²) — high so filter tracks step moves
+KALMAN_MEASUREMENT_NOISE = 0.5  # Measurement noise (mm) — trust clean camera detections
 
 POSE_JUMP_MM    = 80.0      # Maximum allowed jump in pixel space (fallback)
 MIN_TAG_SIDE_PX = 20.0      # reject detections where tag side < this many pixels
@@ -128,11 +129,34 @@ class KalmanFilter3D:
     def initialize(self, x, y, z):
         """Initialize filter with first measurement."""
         self.state = np.array([x, y, z, 0.0, 0.0, 0.0])
-        self.P = np.eye(6) * 5.0
+        # Position is known exactly (home), velocity is completely unknown
+        self.P = np.diag([0.1, 0.1, 0.1, 100.0, 100.0, 100.0])
         self.is_initialized = True
-    
-    def predict(self):
-        """Prediction step: advance state by one time step."""
+
+    def _rebuild(self, dt):
+        """Rebuild F and Q matrices with actual dt."""
+        self.F = np.array([
+            [1, 0, 0, dt, 0,  0],
+            [0, 1, 0, 0,  dt, 0],
+            [0, 0, 1, 0,  0,  dt],
+            [0, 0, 0, 1,  0,  0],
+            [0, 0, 0, 0,  1,  0],
+            [0, 0, 0, 0,  0,  1]
+        ])
+        q = KALMAN_PROCESS_NOISE ** 2
+        self.Q = q * np.array([
+            [dt**4/4, 0,        0,        dt**3/2, 0,        0],
+            [0,       dt**4/4,  0,        0,       dt**3/2,  0],
+            [0,       0,        dt**4/4,  0,       0,        dt**3/2],
+            [dt**3/2, 0,        0,        dt**2,   0,        0],
+            [0,       dt**3/2,  0,        0,       dt**2,    0],
+            [0,       0,        dt**3/2,  0,       0,        dt**2]
+        ])
+
+    def predict(self, dt):
+        """Prediction step: advance state by one time step with actual dt."""
+        dt = np.clip(dt, 0.005, 0.2)  # Sanity check: 5-200 ms
+        self._rebuild(dt)
         self.state = self.F @ self.state
         self.P = self.F @ self.P @ self.F.T + self.Q
     
@@ -162,14 +186,13 @@ class KalmanFilter3D:
         
         # Update state
         self.state = self.state + K @ y
-        
-        # Update covariance
-        self.P = (np.eye(6) - K @ self.H) @ self.P
-        
-        # Check if measurement is an outlier
-        innovation_squared = y @ np.linalg.inv(S) @ y
-        return innovation_squared
-    
+
+        # Joseph form: numerically stable, keeps P symmetric positive-semidefinite
+        I_KH = np.eye(6) - K @ self.H
+        self.P = I_KH @ self.P @ I_KH.T + K @ self.R @ K.T
+
+        return float(y @ np.linalg.solve(S, y))
+
     def get_position(self):
         """Return current position estimate [x, y, z]."""
         return self.state[:3]
@@ -212,7 +235,7 @@ def camera_worker(cam_records, start_ref, stop_event, home_event):
         dt=1.0/30.0,  # Assume ~30Hz camera update
         process_noise_sigma=KALMAN_PROCESS_NOISE,
         measurement_noise_sigma=KALMAN_MEASUREMENT_NOISE,
-        measurement_noise_z=KALMAN_MEASUREMENT_NOISE * 2.0  # Z typically noisier
+        measurement_noise_z=KALMAN_MEASUREMENT_NOISE * 8.0  # Z from tag-size is much noisier than pixel XY
     )
     
     prev_frame_time = time.time()
@@ -226,10 +249,6 @@ def camera_worker(cam_records, start_ref, stop_event, home_event):
         frame_time = time.time()
         dt = frame_time - prev_frame_time
         prev_frame_time = frame_time
-        
-        # Update Kalman filter time step
-        if dt > 0.001:  # Only update if dt is reasonable
-            kf.dt = np.clip(dt, 0.01, 0.1)  # Clamp to reasonable range
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         corners_list, ids, _ = aruco_detector.detectMarkers(gray)
@@ -268,31 +287,28 @@ def camera_worker(cam_records, start_ref, stop_event, home_event):
                           f"tag={tag_side_px:.1f} px  "
                           f"scale={scale_origin:.4f} mm/px")
                     home_event.set()
-                    cam_records.append([t_now, cx, cy, 0.0, 0.0, 0.0, tag_side_px])
+                    continue  # Don't record yet, wait for next frame after home is set
+
+                # Only record measurements after homing is confirmed
+                if not home_event.is_set():
                     continue
 
                 # Outlier rejection in pixel space
                 jump_px = POSE_JUMP_MM / scale_origin
                 is_jump = abs(cx - prev_cx) > jump_px or abs(cy - prev_cy) > jump_px
                 
-                # Convert to mm (XY from pixel shift, Z from tag apparent size)
+                # Convert to mm (X from horizontal pixel shift, Y from vertical pixel shift)
                 tx =  (cx - cx_origin) * scale_origin
                 ty = -(cy - cy_origin) * scale_origin
                 # Z from tag size change: larger apparent size = closer (smaller Z)
                 tz = (TAG_SIZE_MM / tag_size_origin - TAG_SIZE_MM / tag_side_px)
                 
                 # Kalman prediction step
-                kf.predict()
-                
-                # Kalman update with measurement validation
-                innovation_sq = kf.update([tx, ty, tz], is_valid=not is_jump)
-                measurement_valid = not is_jump
-                
-                # Check if innovation is too large (outlier)
-                outlier = innovation_sq > (KALMAN_OUTLIER_SIGMA ** 2)
-                if outlier:
-                    # Reject this measurement but keep the prediction
-                    kf.update([tx, ty, tz], is_valid=False)
+                kf.predict(dt)
+
+                # Only reject pixel-space jumps (false detections); update on everything else
+                if not is_jump:
+                    kf.update([tx, ty, tz])
                 
                 # Get filtered position
                 filtered_pos = kf.get_position()
@@ -337,7 +353,7 @@ def grbl_worker(grbl_records, start_ref, stop_event, home_event):
     interval = 1.0 / TARGET_FPS
 
     try:
-        ser = serial.Serial(PORT, BAUD, timeout=1)
+        ser = serial.Serial(PORT, BAUD, timeout=1, write_timeout=None)
     except Exception as e:
         print(f"  [grbl] Failed to open port: {e}")
         return
@@ -477,17 +493,16 @@ def align_camera_to_grbl(cam_t, cam_tx, cam_ty, cam_tz, cam_tag_px, grbl_t, grbl
     cam_ty_v = cam_ty_v[valid]
     cam_tz_v = cam_tz_v[valid]
 
-    depth_ratio = np.ones_like(cam_tx_v)  # Simplified
-    A_list = [
+    # Quadratic feature matrix: captures linear + lens distortion + cross-axis coupling
+    A = np.column_stack([
         cam_tx_v,
         cam_ty_v,
         cam_tz_v,
-        depth_ratio,
-        cam_tx_v * depth_ratio,
-        cam_ty_v * depth_ratio,
-        np.ones_like(cam_tx_v)
-    ]
-    A = np.column_stack(A_list)
+        cam_tx_v ** 2,
+        cam_ty_v ** 2,
+        cam_tx_v * cam_ty_v,
+        np.ones_like(cam_tx_v),
+    ])
 
     # Fit X
     c_x, _, _, _ = np.linalg.lstsq(A, grbl_x_v, rcond=None)
@@ -516,7 +531,7 @@ def align_camera_to_grbl(cam_t, cam_tx, cam_ty, cam_tz, cam_tag_px, grbl_t, grbl
 
 # ── PLOTTING ───────────────────────────────────────────────────────────────────
 def plot_results(cam_records, grbl_records, csv_stem):
-    """Plot and save camera & GRBL trajectories in 3D."""
+    """Plot and save camera & GRBL trajectories in 3D with pub_fig styling."""
     if not cam_records or not grbl_records:
         print("[plot] Insufficient data to plot")
         return
@@ -531,71 +546,138 @@ def plot_results(cam_records, grbl_records, csv_stem):
         cam_t, cam_tx, cam_ty, cam_tz, cam_px, grbl_t, grbl_x, grbl_y, grbl_z
     )
 
-    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-    fig.suptitle(f"AprilTag Kalman Tracking (3D): {csv_stem}", fontsize=14, fontweight='bold')
+    fig = plt.figure(figsize=(16, 10))
+    fig.suptitle(f"AprilTag Kalman Tracking (3D)  —  {len(cam_t)} cam frames / {len(grbl_t)} GRBL pts  —  {csv_stem}", fontsize=13, fontweight='bold')
+    gs = fig.add_gridspec(3, 3, hspace=0.45, wspace=0.38)
 
-    ax = axes[0, 0]
-    ax.scatter(cam_t, cam_tx, s=10, alpha=0.6, label="Raw camera")
-    ax.scatter(cam_t, tx_aligned, s=10, alpha=0.6, label="Aligned")
-    ax.plot(grbl_t, grbl_x, 'r-', linewidth=2, label="GRBL command")
-    ax.set_ylabel("X (mm)")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    # Row 0 — GRBL path
+    ax = fig.add_subplot(gs[0, 0])
+    ax.plot(grbl_x, grbl_y, "b.-", lw=1.5, ms=2)
+    ax.plot(grbl_x[0],  grbl_y[0],  "go", ms=8)
+    ax.plot(grbl_x[-1], grbl_y[-1], "ro", ms=8)
+    ax.set(xlabel="X (mm)", ylabel="Y (mm)", title="GRBL Toolpath")
+    ax.set_aspect("equal"); ax.grid(True)
+    ax.legend(["Path", "Start", "End"], fontsize=8)
+    pub_fig(ax, fig)
 
-    ax = axes[0, 1]
-    ax.scatter(cam_t, cam_ty, s=10, alpha=0.6, label="Raw camera")
-    ax.scatter(cam_t, ty_aligned, s=10, alpha=0.6, label="Aligned")
-    ax.plot(grbl_t, grbl_y, 'r-', linewidth=2, label="GRBL command")
-    ax.set_ylabel("Y (mm)")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-
-    ax = axes[0, 2]
-    ax.scatter(cam_t, cam_tz, s=10, alpha=0.6, label="Camera (tag size)")
-    ax.scatter(cam_t, tz_aligned, s=10, alpha=0.6, label="Aligned")
-    ax.plot(grbl_t, grbl_z, 'r-', linewidth=2, label="GRBL command")
-    ax.set_ylabel("Z (mm)")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-
-    ax = axes[1, 0]
+    # Row 0 — Camera aligned path
+    ax = fig.add_subplot(gs[0, 1])
     valid = np.isfinite(tx_aligned) & np.isfinite(ty_aligned)
     if valid.sum() > 10:
-        ax.plot(grbl_x, grbl_y, 'r-', linewidth=2, label="GRBL path", alpha=0.7)
-        ax.scatter(tx_aligned[valid], ty_aligned[valid], s=5, alpha=0.6, c=cam_t[valid], cmap='viridis')
-        ax.set_aspect('equal')
-        ax.set_xlabel("X (mm)")
-        ax.set_ylabel("Y (mm)")
-        ax.set_title("Aligned XY Trajectory")
-        ax.legend()
-        ax.grid(True, alpha=0.3)
+        ax.plot(tx_aligned[valid], ty_aligned[valid], "m.-", lw=1.5, ms=2)
+        ax.set_aspect("equal")
+        ax.set(xlabel="X cam (mm)", ylabel="Y cam (mm)", title="Camera Aligned Path")
+    ax.grid(True)
+    pub_fig(ax, fig)
 
-    ax = axes[1, 1]
-    valid = np.isfinite(cam_tx) & np.isfinite(cam_ty)
-    if valid.sum() > 10:
-        ax.scatter(cam_tx[valid], cam_ty[valid], s=5, alpha=0.6, c=cam_t[valid], cmap='plasma')
-        ax.set_aspect('equal')
-        ax.set_xlabel("X (mm)")
-        ax.set_ylabel("Y (mm)")
-        ax.set_title("Raw Camera XY")
-        ax.grid(True, alpha=0.3)
+    # Row 0 — Normalized overlay
+    ax = fig.add_subplot(gs[0, 2])
+    if len(grbl_x) > 1:
+        x_min, x_max = grbl_x.min(), grbl_x.max()
+        y_min, y_max = grbl_y.min(), grbl_y.max()
+        gx = (grbl_x - x_min) / (x_max - x_min + 1e-6)
+        gy = (grbl_y - y_min) / (y_max - y_min + 1e-6)
+        ax.plot(gx, gy, "b-", lw=1.5, alpha=0.8, label="GRBL")
+        if valid.sum() > 1:
+            # Use GRBL scale so amplitude errors are visible, not hidden by independent normalisation
+            nx = (tx_aligned[valid] - x_min) / (x_max - x_min + 1e-6)
+            ny = (ty_aligned[valid] - y_min) / (y_max - y_min + 1e-6)
+            ax.plot(nx, ny, "m-", lw=1.5, alpha=0.8, label="Camera")
+    ax.set(xlabel="Norm X", ylabel="Norm Y", title="Path Overlay (normalised)")
+    ax.legend(fontsize=8); ax.grid(True)
+    pub_fig(ax, fig)
 
-    ax = axes[1, 2]
-    info_text = f"Kalman Filter (3D)\n"
-    info_text += f"Process Noise: {KALMAN_PROCESS_NOISE} mm/s²\n"
-    info_text += f"Measurement Noise XY: {KALMAN_MEASUREMENT_NOISE} mm\n"
-    info_text += f"Measurement Noise Z: {KALMAN_MEASUREMENT_NOISE*2.0} mm\n"
-    info_text += f"Outlier Threshold: {KALMAN_OUTLIER_SIGMA}σ"
-    ax.text(0.5, 0.5, info_text,
-            ha='center', va='center', fontsize=10, transform=ax.transAxes, bbox=dict(boxstyle='round', facecolor='wheat'))
-    ax.axis('off')
+    # Row 1 — X vs time
+    ax = fig.add_subplot(gs[1, 0])
+    ax.plot(grbl_t, grbl_x, "b-", lw=1.5, label="GRBL")
+    valid_t = np.isfinite(tx_aligned)
+    if valid_t.sum() > 0:
+        ax.plot(cam_t[valid_t], tx_aligned[valid_t], "k--", lw=1, alpha=0.7, label="Camera")
+    ax.set(xlabel="Time (s)", ylabel="X (mm)", title="X Position")
+    ax.legend(fontsize=8); ax.grid(True)
+    pub_fig(ax, fig)
 
-    plt.tight_layout()
+    # Row 1 — Y vs time
+    ax = fig.add_subplot(gs[1, 1])
+    ax.plot(grbl_t, grbl_y, "b-", lw=1.5, label="GRBL")
+    valid_t = np.isfinite(ty_aligned)
+    if valid_t.sum() > 0:
+        ax.plot(cam_t[valid_t], ty_aligned[valid_t], "k--", lw=1, alpha=0.7, label="Camera")
+    ax.set(xlabel="Time (s)", ylabel="Y (mm)", title="Y Position")
+    ax.legend(fontsize=8); ax.grid(True)
+    pub_fig(ax, fig)
+
+    # Row 1 — Z vs time
+    ax = fig.add_subplot(gs[1, 2])
+    ax.plot(grbl_t, grbl_z, "b-", lw=1.5, label="GRBL")
+    valid_t = np.isfinite(tz_aligned)
+    if valid_t.sum() > 0:
+        ax.plot(cam_t[valid_t], tz_aligned[valid_t], "k--", lw=1, alpha=0.7, label="Camera")
+    ax.set(xlabel="Time (s)", ylabel="Z (mm)", title="Z Position")
+    ax.legend(fontsize=8); ax.grid(True)
+    pub_fig(ax, fig)
+
+    # Row 2 — Error stats
+    ax = fig.add_subplot(gs[2, 0])
+    err_labels  = ["X", "Y", "Z"]
+    err_avg     = []
+    err_max     = []
+    err_rms     = []
+    WARMUP_S = 10.0  # skip initial filter warm-up / machine acceleration phase
+    cam_aligned = [tx_aligned, ty_aligned, tz_aligned]
+    for ci, grbl_col in enumerate([grbl_x, grbl_y, grbl_z]):
+        cc = cam_aligned[ci]
+        valid_pts = np.isfinite(cc) & (cam_t > WARMUP_S)
+        if valid_pts.sum() > 1:
+            ct_valid  = cam_t[valid_pts]
+            grbl_interp = np.interp(ct_valid, grbl_t, grbl_col)
+            err = np.abs(cc[valid_pts] - grbl_interp)
+            err_avg.append(float(err.mean()))
+            err_max.append(float(err.max()))
+            err_rms.append(float(np.sqrt((err**2).mean())))
+        else:
+            err_avg.append(np.nan); err_max.append(np.nan); err_rms.append(np.nan)
+
+    print("\nPosition Error (camera vs GRBL):")
+    for i, lbl in enumerate(err_labels):
+        print(f"  {lbl}  Avg={err_avg[i]:.2f}  Max={err_max[i]:.2f}  RMS={err_rms[i]:.2f}  (mm)")
+
+    if len(residuals) > 0:
+        ax.plot(cam_t, residuals, "r-", lw=1.5)
+        ax.set(xlabel="Time (s)", ylabel="Error (mm)", title="Position Error (3D)")
+    ax.grid(True)
+    pub_fig(ax, fig)
+
+    # Row 2 — Camera raw XY
+    ax = fig.add_subplot(gs[2, 1])
+    ax.scatter(cam_tx, cam_ty, s=5, alpha=0.6, c=cam_t, cmap='plasma')
+    ax.set_aspect("equal")
+    ax.set(xlabel="X (mm)", ylabel="Y (mm)", title="Camera Raw XY")
+    ax.grid(True)
+    pub_fig(ax, fig)
+
+    # Row 2 — Error bar chart
+    ax = fig.add_subplot(gs[2, 2])
+    bar_x   = np.arange(3)           # Avg, Max, RMS
+    bar_w   = 0.25
+    colors  = ["#1f77b4", "#ff7f0e", "#2ca02c"]   # X=blue, Y=orange, Z=green
+    metrics = [err_avg, err_max, err_rms]
+    metric_labels = ["Avg", "Max", "RMS"]
+    for j, (lbl, vals) in enumerate(zip(err_labels, zip(*metrics))):
+        ax.bar(bar_x + j * bar_w, vals, bar_w, label=lbl, color=colors[j])
+    ax.set_xticks(bar_x + bar_w)
+    ax.set_xticklabels(metric_labels)
+    ax.set(ylabel="Error (mm)", title="Position Error Statistics")
+    ax.legend(fontsize=8); ax.grid(True, axis="y")
+    pub_fig(ax, fig)
+
+    plt.savefig("apriltag_run.png", dpi=150)
+    plt.show()
+
     script_dir = os.path.dirname(os.path.abspath(__file__))
     data_dir = os.path.join(script_dir, "Data")
-    os.makedirs(data_dir, exist_ok=True)
     plot_path = os.path.join(data_dir, f"{csv_stem}.png")
-    plt.savefig(plot_path, dpi=100)
+    plt.savefig(plot_path, dpi=150)
     print(f"[plot] Saved: {plot_path}")
     plt.close()
 

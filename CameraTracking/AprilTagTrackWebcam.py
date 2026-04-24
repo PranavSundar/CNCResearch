@@ -23,6 +23,10 @@ import numpy as np
 import cv2
 import matplotlib.pyplot as plt
 from datetime import datetime
+import os
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from pub_fig import pub_fig
 
 if not hasattr(cv2, "aruco"):
     sys.exit(
@@ -459,16 +463,17 @@ if __name__ == "__main__":
     ax.plot(pos[:, 0], pos[:, 1], "b.-", lw=1.5, ms=2)
     ax.plot(pos[0, 0],  pos[0, 1],  "go", ms=8)
     ax.plot(pos[-1, 0], pos[-1, 1], "ro", ms=8)
-    ax.set(xlabel="X (in)", ylabel="Y (in)", title="GRBL Toolpath")
+    ax.set(xlabel="X (mm)", ylabel="Y (mm)", title="GRBL Toolpath")
     ax.set_aspect("equal"); ax.grid(True)
     ax.legend(["Path", "Start", "End"], fontsize=8)
+    pub_fig(ax, fig)
 
     ax = fig.add_subplot(gs[0, 1])
     if has_cam:
         if has_cam_pose:
             vp = np.isfinite(cam_tx)
             ax.plot(cam_tx[vp], cam_ty[vp], "m.-", lw=1.5, ms=2)
-            ax.set(xlabel="X cam (in)", ylabel="Y cam (in)", title="Camera Pose Path")
+            ax.set(xlabel="X cam (mm)", ylabel="Y cam (mm)", title="Camera Pose Path")
         else:
             ax.plot(cam_cx, cam_cy, "m.-", lw=1.5, ms=2)
             ax.invert_yaxis()
@@ -476,6 +481,7 @@ if __name__ == "__main__":
     else:
         ax.set_title("Camera Path (no data)")
     ax.grid(True)
+    pub_fig(ax, fig)
 
     # Normalised overlay
     ax = fig.add_subplot(gs[0, 2])
@@ -491,6 +497,7 @@ if __name__ == "__main__":
             ax.plot(nx, ny, "m-", lw=1.5, alpha=0.8, label="Camera")
     ax.set(xlabel="Norm X", ylabel="Norm Y", title="Path Overlay (normalised)")
     ax.legend(fontsize=8); ax.grid(True)
+    pub_fig(ax, fig)
 
     # Row 1 — X / Y / Z vs time ────────────────────────────────────────────────
     cam_cols = [cam_tx, cam_ty, cam_tz] if has_cam_pose else [None, None, None]
@@ -505,8 +512,9 @@ if __name__ == "__main__":
             vp = np.isfinite(cam_col)
             if vp.sum() > 0:
                 ax.plot(cam_t[vp], cam_col[vp], "k--", lw=1, alpha=0.7, label="Camera")
-        ax.set(xlabel="Time (s)", ylabel=f"{label} (in)", title=f"{label} Position")
+        ax.set(xlabel="Time (s)", ylabel=f"{label} (mm)", title=f"{label} Position")
         ax.legend(fontsize=8); ax.grid(True)
+        pub_fig(ax, fig)
 
     # ── Position error stats (camera vs GRBL) ─────────────────────────────────
     err_labels  = ["X", "Y", "Z"]
@@ -542,12 +550,14 @@ if __name__ == "__main__":
         ax.plot(tv_c, spd_c, "m--", lw=1, alpha=0.8, label="Camera XY")
     ax.set(xlabel="Time (s)", ylabel="Speed (mm/s)", title="Velocity")
     ax.legend(fontsize=8); ax.grid(True)
+    pub_fig(ax, fig)
 
     ax = fig.add_subplot(gs[2, 1])
     if len(accel):
         ax.plot(t_acc, accel, "c-", lw=1.5)
     ax.set(xlabel="Time (s)", ylabel="Accel (mm/s²)", title="GRBL Acceleration")
     ax.grid(True)
+    pub_fig(ax, fig)
 
     ax = fig.add_subplot(gs[2, 2])
     bar_x   = np.arange(3)           # Avg, Max, RMS
@@ -561,6 +571,7 @@ if __name__ == "__main__":
     ax.set_xticklabels(metric_labels)
     ax.set(ylabel="Error (mm)", title="Position Error Statistics")
     ax.legend(fontsize=8); ax.grid(True, axis="y")
+    pub_fig(ax, fig)
 
     plt.savefig("apriltag_run.png", dpi=150)
     plt.show()
